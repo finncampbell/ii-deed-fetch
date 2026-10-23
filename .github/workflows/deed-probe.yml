@@ -1,0 +1,36 @@
+# deed-probe.yml — one-off feasibility probe (DEC-072 step 2): can THIS
+# repository's GitHub-hosted runner still fetch a Luxembourg publication from
+# lbr.lu behind the FriendlyCaptcha proof-of-work?
+#
+# What it does: journals API (open JSON) → newest journal page → wait for the
+# publication list (one captcha solve, timed) → click one Registration row's
+# "Download the publication" control (second solve, timed) → report the PDF's
+# byte count in the log. The PDF is counted and discarded: nothing is uploaded,
+# no artifact, no file leaves the runner. Manual dispatch only.
+#
+# A refusal here (list never renders in the budget) ends the automated route —
+# no disguising, no retries with other fingerprints (owner rules, DEC-068).
+name: LBR deed probe
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Playwright + Chromium
+        run: |
+          pip install -q -r requirements.txt
+          python -m playwright install --with-deps chromium
+      - name: Probe (timings only, PDF discarded)
+        env:
+          PROBE_ONLY: "1"
+        run: python deed_fetch.py --probe
