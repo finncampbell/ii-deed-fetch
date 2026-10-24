@@ -279,6 +279,38 @@ def launch(p, nav_timeout_ms: int):
 
 # ── Probe mode ───────────────────────────────────────────────────────────────
 
+_PUB_RE = re.compile(r"RESA_\d{4}_\d+\.\d+")
+
+
+def _dom_report(page, label: str) -> None:
+    """
+    Structure-only diagnostics of the journal table (publication numbers,
+    counts, pager state — never entity names or deed text). Added 2026-10-24
+    after the first queue job found none of its claimed rows on the page.
+    """
+    try:
+        trs = page.locator("table tr")
+        n_tr = trs.count()
+        n_icon = page.locator("table tr").filter(has=page.locator(DOWNLOAD_ICON)).count()
+        pubs = []
+        for i in range(min(n_tr, 8)):
+            m = _PUB_RE.search(trs.nth(i).inner_text())
+            pubs.append(m.group(0) if m else "-")
+        all_pubs = _PUB_RE.findall(page.inner_text("body"))
+        sel = page.locator(TYPE_FILTER)
+        opts = sel.first.evaluate("s => Array.from(s.options).map(o => o.value + ':' + o.text.trim().slice(0, 24))") if sel.count() else None
+        pager = page.evaluate(
+            "() => Array.from(document.querySelectorAll('svg[data-icon=\"chevron-right\"], span.page'))"
+            ".slice(0, 12).map(e => e.tagName + '.' + (e.getAttribute('class') || '') + ':' + (e.textContent || '').trim().slice(0, 6))")
+        tables = page.evaluate("() => document.querySelectorAll('table').length")
+        sample_pub = all_pubs[0] if all_pubs else None
+        has_text_hit = page.locator("table tr").filter(has_text=row_pattern(sample_pub)).count() if sample_pub else None
+        print(f"PROBE dom[{label}] tables={tables} tr={n_tr} rows_with_icon={n_icon} first_rows={pubs} "
+              f"pubs_in_body={len(all_pubs)} min={min(all_pubs) if all_pubs else None} max={max(all_pubs) if all_pubs else None} "
+              f"has_text_hit_for_{sample_pub}={has_text_hit} filter_options={opts} pager={pager}", flush=True)
+    except Exception as exc:  # diagnostics must never end the probe
+        print(f"PROBE dom[{label}] failed: {exc}", flush=True)
+
 def probe(captcha_timeout_s: int, nav_timeout_s: int, poll_s: int) -> int:
     """Newest journal → list captcha → first Registration row → download; print timings; discard."""
     from playwright.sync_api import sync_playwright
@@ -298,7 +330,12 @@ def probe(captcha_timeout_s: int, nav_timeout_s: int, poll_s: int) -> int:
             print(f"PROBE list_status={status} list_captcha_s={list_s:.0f}", flush=True)
             if status != "ok":
                 return 1
-            apply_type_filter(page, "INS")
+            _dom_report(page, "before-filter")
+            applied = apply_type_filter(page, "INS")
+            print(f"PROBE type_filter_applied={applied}", flush=True)
+            _dom_report(page, "after-filter")
+            if go_next_page(page):
+                _dom_report(page, "page-2")
             rows = page.locator("table tr").filter(has_text=re.compile(r"\bRegistration\b"))
             n = rows.count()
             print(f"PROBE registration_rows_on_page={n}", flush=True)
