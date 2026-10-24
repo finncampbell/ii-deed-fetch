@@ -1,0 +1,53 @@
+# deed-fetch.yml — the continuous RESA deed fetch (owner's private repo:
+# docs/specs/deed_fetch_queue.md, DEC-072).
+#
+# Every 30 minutes one job claims up to BATCH_SIZE publications from the
+# server's deed queue, downloads each through the register's own page control
+# (one captcha proof-of-work per deed, solved by the browser), posts the bytes
+# to the server and exits before its own budget. One job at a time; the server
+# enforces the daily ceiling and pauses. No artifacts — nothing is kept here.
+#
+# Secrets (repository settings, owner only): PIPELINE_SERVER_URL, PIPELINE_INGEST_TOKEN.
+# GitHub disables cron on public repositories after 60 days without a commit;
+# the monthly sync from the private repository keeps it alive.
+name: Deed fetch
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: deed-fetch
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-1.47.0
+      - name: Install Playwright + Chromium
+        run: |
+          pip install -q -r requirements.txt
+          python -m playwright install --with-deps chromium
+      - name: Fetch
+        env:
+          SERVER_URL: ${{ secrets.PIPELINE_SERVER_URL }}
+          PIPELINE_INGEST_TOKEN: ${{ secrets.PIPELINE_INGEST_TOKEN }}
+          BATCH_SIZE: "10"
+          CAPTCHA_TIMEOUT_S: "720"
+          JOB_BUDGET_MIN: "95"
+          SOLVE_ESTIMATE_S: "300"
+          HEARTBEAT_S: "120"
+        run: python deed_fetch.py
