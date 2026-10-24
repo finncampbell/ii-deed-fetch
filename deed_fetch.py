@@ -99,6 +99,26 @@ def row_pattern(publication_number: str) -> re.Pattern:
     return re.compile(re.escape(publication_number) + r"(?!\d)")
 
 
+_PUB_IN_ROW_RE = re.compile(r"RESA_\d{4}_\d+\.\d+")
+
+
+def index_rows(row_texts: list[str]) -> dict[str, int]:
+    """
+    publication number → row index, from the table rows' texts (one
+    all_inner_texts() call). Why not Playwright's `filter(has_text=…)`: on the
+    live journal page it returned 0 for numbers that were plainly in the row
+    text (probe 2026-10-24, run 40072890311: `has_text_hit_for_RESA_2026_228.975=0`
+    while the regex found it), so the first queue job reported every row
+    missing. Matching the text ourselves is what the probe proved works.
+    """
+    out: dict[str, int] = {}
+    for i, text in enumerate(row_texts):
+        m = _PUB_IN_ROW_RE.search(text or "")
+        if m and m.group(0) not in out:
+            out[m.group(0)] = i
+    return out
+
+
 def budget_allows(started: float, now: float, budget_min: int, estimate_s: int) -> bool:
     """True when another solve of `estimate_s` seconds still fits before the job budget ends."""
     return (now - started) + estimate_s <= budget_min * 60
@@ -443,16 +463,19 @@ def run(args: argparse.Namespace) -> int:
                     pages_walked = 0
                     while pending:
                         pages_walked += 1
+                        trs = page.locator("table tr")
+                        index = index_rows(trs.all_inner_texts())
+                        log.info("journal %s page %d: %d rows, %d publication numbers, %d of ours",
+                                 key, pages_walked, trs.count(), len(index), sum(1 for p in pending if p in index))
                         for pub in list(pending):
                             if not budget_allows(started, time.time(), budget_min, solve_estimate_s):
                                 summary["stop_reason"] = "budget"
                                 pending = {}
                                 break
-                            tr = page.locator("table tr").filter(has_text=row_pattern(pub))
-                            if tr.count() == 0:
+                            if pub not in index:
                                 continue
                             row = pending.pop(pub)
-                            pdf, err, dl_s = download_row(page, tr.first, captcha_timeout_s * 1000, blocked)
+                            pdf, err, dl_s = download_row(page, trs.nth(index[pub]), captcha_timeout_s * 1000, blocked)
                             blocked["hit"] = False
                             body = report_body(row, worker_id, pdf, error=err, list_captcha_s=round(list_s),
                                                download_captcha_s=round(dl_s))
