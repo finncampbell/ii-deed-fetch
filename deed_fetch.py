@@ -396,22 +396,12 @@ def run(args: argparse.Namespace) -> int:
     started = time.time()
     summary = {"started_at": datetime.now(timezone.utc).isoformat(), "claimed": 0, "fetched": 0,
                "failed": 0, "released": 0, "list_captcha_s": None, "stop_reason": "complete", "notes": None}
-    try:
-        claimed = q.claim(batch)
-    except requests.RequestException as exc:
-        log.error("claim failed: %s", exc)            # server busy / down: nothing claimed, nothing to undo
-        return 0
-    items = claimed.get("items", [])
-    summary["claimed"] = len(items)
-    if not items:
-        summary["stop_reason"] = f"nothing-to-do ({claimed.get('paused') or 'queue empty'})"
-        log.info("%s; remaining=%s", summary["stop_reason"], claimed.get("remaining"))
-        _finish(q, summary)
-        return 0
-    log.info("claimed %d (remaining %s): %s", len(items), claimed.get("remaining"),
-             [r["publication_number"] for r in items])
-
-    open_ids = {r["id"] for r in items}
+    # Claims are made in a loop until the job budget is spent (2026-10-27):
+    # one cron job = one browser = many batches. Before, one batch per job
+    # meant setup + list captcha + a cron wait for every 10 deeds; the route
+    # ran ~19 jobs a day for ~190 deeds. open_ids is shared with the heartbeat.
+    open_ids: set = set()
+    batches = 0
     stop = threading.Event()
 
     def beat() -> None:
@@ -432,68 +422,98 @@ def run(args: argparse.Namespace) -> int:
                 log.warning("release failed (%s) — the server's stale reclaim will free them", exc)
             open_ids.clear()
 
+    def process_batch(items: list[dict], page, blocked: dict) -> None:
+        """One claimed batch: journal pages -> rows -> reports. Sets summary['stop_reason']
+        to 'budget' / 'blocked' when the loop must end."""
+        for key, rows in group_by_journal(items):
+            if not budget_allows(started, time.time(), budget_min, solve_estimate_s):
+                summary["stop_reason"] = "budget"
+                break
+            jid = journal_page_id(rows[0].get("publication_date") or "", key)
+            if not jid:
+                for r in rows:
+                    _report(q, summary, open_ids, report_body(r, worker_id, None, error="journal-missing"))
+                continue
+            page.goto(JOURNAL_PAGE.format(jid=jid), wait_until="domcontentloaded",
+                      timeout=nav_timeout_s * 1000)
+            status, list_s = wait_for_list(page, captcha_timeout_s, poll_s)
+            summary["list_captcha_s"] = round(list_s)
+            log.info("journal %s list %s after %.0fs", key, status, list_s)
+            if status != "ok":
+                # List-level failure is about this runner/session, not the rows:
+                # release everything, stop the run, let the server see it.
+                summary["stop_reason"] = f"list-{status}"
+                release_rest(f"list-{status}")
+                break
+            kinds = {r.get("deposit_type_code") or "INS" for r in rows}
+            if len(kinds) == 1:
+                apply_type_filter(page, next(iter(kinds)))
+            pending = {r["publication_number"]: r for r in rows}
+            pages_walked = 0
+            while pending:
+                pages_walked += 1
+                trs = page.locator("table tr")
+                index = index_rows(trs.all_inner_texts())
+                log.info("journal %s page %d: %d rows, %d publication numbers, %d of ours",
+                         key, pages_walked, trs.count(), len(index), sum(1 for p in pending if p in index))
+                for pub in list(pending):
+                    if not budget_allows(started, time.time(), budget_min, solve_estimate_s):
+                        summary["stop_reason"] = "budget"
+                        pending = {}
+                        break
+                    if pub not in index:
+                        continue
+                    row = pending.pop(pub)
+                    pdf, err, dl_s = download_row(page, trs.nth(index[pub]), captcha_timeout_s * 1000, blocked)
+                    blocked["hit"] = False
+                    body = report_body(row, worker_id, pdf, error=err, list_captcha_s=round(list_s),
+                                       download_captcha_s=round(dl_s))
+                    _report(q, summary, open_ids, body)
+                    log.info("%s %s %.0fs%s", pub, "ok" if pdf else "FAILED", dl_s,
+                             f" ({len(pdf)} bytes)" if pdf else f" {err}")
+                    if err and err.startswith("download-blocked"):
+                        summary["stop_reason"] = "blocked"
+                        pending = {}
+                        break
+                if summary["stop_reason"] in ("budget", "blocked"):
+                    break
+                if pending and not go_next_page(page):
+                    break
+            for pub, row in pending.items():
+                _report(q, summary, open_ids,
+                        report_body(row, worker_id, None,
+                                    error=f"row-missing on journal page (after {pages_walked} pages)"))
+            if summary["stop_reason"] in ("budget", "blocked"):
+                break
+
     try:
         with sync_playwright() as p:
             browser, page, blocked = launch(p, nav_timeout_s * 1000)
             try:
-                for key, rows in group_by_journal(items):
-                    if not budget_allows(started, time.time(), budget_min, solve_estimate_s):
+                while True:
+                    # Room for a list captcha plus one download before the budget ends.
+                    if not budget_allows(started, time.time(), budget_min, solve_estimate_s * 2):
                         summary["stop_reason"] = "budget"
                         break
-                    jid = journal_page_id(rows[0].get("publication_date") or "", key)
-                    if not jid:
-                        for r in rows:
-                            _report(q, summary, open_ids, report_body(r, worker_id, None, error="journal-missing"))
-                        continue
-                    page.goto(JOURNAL_PAGE.format(jid=jid), wait_until="domcontentloaded",
-                              timeout=nav_timeout_s * 1000)
-                    status, list_s = wait_for_list(page, captcha_timeout_s, poll_s)
-                    summary["list_captcha_s"] = round(list_s)
-                    log.info("journal %s list %s after %.0fs", key, status, list_s)
-                    if status != "ok":
-                        # List-level failure is about this runner/session, not the rows:
-                        # release everything, stop the run, let the server see it.
-                        summary["stop_reason"] = f"list-{status}"
-                        release_rest(f"list-{status}")
+                    try:
+                        claimed = q.claim(batch)
+                    except requests.RequestException as exc:
+                        # Server busy / down: nothing new claimed, nothing to undo.
+                        log.error("claim failed: %s", exc)
+                        summary["stop_reason"] = "claim-failed" if batches else "claim-failed (nothing claimed)"
                         break
-                    kinds = {r.get("deposit_type_code") or "INS" for r in rows}
-                    if len(kinds) == 1:
-                        apply_type_filter(page, next(iter(kinds)))
-                    pending = {r["publication_number"]: r for r in rows}
-                    pages_walked = 0
-                    while pending:
-                        pages_walked += 1
-                        trs = page.locator("table tr")
-                        index = index_rows(trs.all_inner_texts())
-                        log.info("journal %s page %d: %d rows, %d publication numbers, %d of ours",
-                                 key, pages_walked, trs.count(), len(index), sum(1 for p in pending if p in index))
-                        for pub in list(pending):
-                            if not budget_allows(started, time.time(), budget_min, solve_estimate_s):
-                                summary["stop_reason"] = "budget"
-                                pending = {}
-                                break
-                            if pub not in index:
-                                continue
-                            row = pending.pop(pub)
-                            pdf, err, dl_s = download_row(page, trs.nth(index[pub]), captcha_timeout_s * 1000, blocked)
-                            blocked["hit"] = False
-                            body = report_body(row, worker_id, pdf, error=err, list_captcha_s=round(list_s),
-                                               download_captcha_s=round(dl_s))
-                            _report(q, summary, open_ids, body)
-                            log.info("%s %s %.0fs%s", pub, "ok" if pdf else "FAILED", dl_s,
-                                     f" ({len(pdf)} bytes)" if pdf else f" {err}")
-                            if err and err.startswith("download-blocked"):
-                                summary["stop_reason"] = "blocked"
-                                pending = {}
-                                break
-                        if summary["stop_reason"] in ("budget", "blocked"):
-                            break
-                        if pending and not go_next_page(page):
-                            break
-                    for pub, row in pending.items():
-                        _report(q, summary, open_ids,
-                                report_body(row, worker_id, None,
-                                            error=f"row-missing on journal page (after {pages_walked} pages)"))
+                    items = claimed.get("items", [])
+                    if not items:
+                        why = claimed.get("paused") or "queue empty"
+                        summary["stop_reason"] = f"nothing-to-do ({why})" if batches == 0 else f"queue-paused ({why})"
+                        log.info("%s; remaining=%s", summary["stop_reason"], claimed.get("remaining"))
+                        break
+                    batches += 1
+                    summary["claimed"] += len(items)
+                    open_ids.update(r["id"] for r in items)
+                    log.info("batch %d: claimed %d (remaining %s): %s", batches, len(items), claimed.get("remaining"),
+                             [r["publication_number"] for r in items])
+                    process_batch(items, page, blocked)
                     if summary["stop_reason"] in ("budget", "blocked"):
                         break
             finally:
@@ -505,8 +525,9 @@ def run(args: argparse.Namespace) -> int:
     finally:
         stop.set()
         release_rest(summary["stop_reason"])
+        summary["notes"] = (summary.get("notes") or f"batches={batches}")[:300]
         _finish(q, summary)
-    log.info("done: claimed %d fetched %d failed %d released %d stop=%s", summary["claimed"],
+    log.info("done: batches %d claimed %d fetched %d failed %d released %d stop=%s", batches, summary["claimed"],
              summary["fetched"], summary["failed"], summary["released"], summary["stop_reason"])
     return 0
 

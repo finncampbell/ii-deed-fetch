@@ -28,4 +28,4 @@ The canonical copy of these files lives in the owner's private repository
 Note: GitHub disables scheduled workflows on public repositories after 60 days without
 a commit; the monthly sync keeps the schedule alive.
 
-Source commit: 1b62f589 (investment-intelligence, helper/ii-deed-fetch/)
+Source commit: 049b2513 (investment-intelligence, helper/ii-deed-fetch/)

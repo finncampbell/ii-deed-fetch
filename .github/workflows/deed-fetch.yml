@@ -1,11 +1,22 @@
 # deed-fetch.yml — the continuous RESA deed fetch (owner's private repo:
 # docs/specs/deed_fetch_queue.md, DEC-072).
 #
-# Every 30 minutes one job claims up to BATCH_SIZE publications from the
-# server's deed queue, downloads each through the register's own page control
-# (one captcha proof-of-work per deed, solved by the browser), posts the bytes
-# to the server and exits before its own budget. One job at a time; the server
-# enforces the daily ceiling and pauses. No artifacts — nothing is kept here.
+# Every hour one job starts and keeps claiming batches of BATCH_SIZE
+# publications from the server's deed queue for JOB_BUDGET_MIN minutes,
+# downloading each through the register's own page control (one captcha
+# proof-of-work per deed, solved by the browser) and posting the bytes to the
+# server. One job at a time; the server enforces the daily ceiling and pauses.
+# No artifacts — nothing is kept here.
+#
+# 2026-10-27: hourly, not every 30 min. With one batch per job and a 30-min
+# cron, two ticks fired during every ~60-min job and GitHub cancelled the
+# older waiting run each time (6 of 10 runs "cancelled" — cosmetic, nothing
+# was lost, the route never idled). Now a job runs for ~100 min claiming
+# batch after batch, so at most one run waits and none is cancelled, and the
+# per-batch setup + list captcha is paid once per job, not once per 10 deeds.
+# Throughput is bound by the captcha solve time (~3.5–4.5 min per deed from a
+# runner), not by the schedule; doubling needs a second concurrent job, which
+# is the owner's call (register exposure).
 #
 # Secrets (repository settings, owner only): PIPELINE_SERVER_URL, PIPELINE_INGEST_TOKEN.
 # GitHub disables cron on public repositories after 60 days without a commit;
@@ -14,7 +25,7 @@ name: Deed fetch
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "0 * * * *"
   workflow_dispatch:
 
 permissions: {}
@@ -26,7 +37,7 @@ concurrency:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 110
+    timeout-minutes: 118   # JOB_BUDGET_MIN + one worst-case captcha (12 min) + setup
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -47,7 +58,7 @@ jobs:
           PIPELINE_INGEST_TOKEN: ${{ secrets.PIPELINE_INGEST_TOKEN }}
           BATCH_SIZE: "10"
           CAPTCHA_TIMEOUT_S: "720"
-          JOB_BUDGET_MIN: "95"
+          JOB_BUDGET_MIN: "100"
           SOLVE_ESTIMATE_S: "300"
           HEARTBEAT_S: "120"
         run: python deed_fetch.py
